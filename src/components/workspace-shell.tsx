@@ -85,7 +85,7 @@ export function WorkspaceShell() {
   // Map pathname to tab index (mirrors TABS order in mobile-tab-bar)
   const getTabIndex = useCallback((path: string): number => {
     if (path.startsWith('/dashboard')) return 0
-    if (path.startsWith('/conductor') || path.startsWith('/agents')) return 1
+    if (path.startsWith('/conductor') || path.startsWith('/agents') || path.startsWith('/operations')) return 1
     if (path.startsWith('/chat') || path === '/new' || path === '/') return 2
     if (path.startsWith('/skills')) return 3
     if (path.startsWith('/settings')) return 4
@@ -103,18 +103,20 @@ export function WorkspaceShell() {
     queryKey: ['auth-status'],
     queryFn: async () => {
       const controller = new AbortController()
-      const timeout = globalThis.setTimeout(() => controller.abort(), 5_000)
+      // /api/auth-check is local (no gateway calls) — should respond in <100ms.
+      // If it doesn't, something is very wrong; fail fast instead of stalling.
+      const timeout = globalThis.setTimeout(() => controller.abort(), 2_000)
 
       let res: Response
       try {
         res = await fetch('/api/auth-check', { signal: controller.signal })
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') {
-          throw new Error('Request timed out after 5 seconds')
+          throw new Error('Request timed out after 2 seconds')
         }
         throw error instanceof Error
           ? error
-          : new Error('Failed to connect to ClawSuite server')
+          : new Error('Failed to connect to ControlSuite server')
       } finally {
         globalThis.clearTimeout(timeout)
       }
@@ -125,14 +127,23 @@ export function WorkspaceShell() {
       return data
     },
     staleTime: 60_000,
-    retry: 2,
-    retryDelay: 1_000,
+    retry: 1,
+    retryDelay: 500,
   })
 
+  // Hard cap on the "Initializing" splash. Whatever the auth state is after
+  // ~3.5s, we proceed — the splash should never stick on mobile/Tailscale.
+  const [splashTimedOut, setSplashTimedOut] = useState(false)
+  useEffect(() => {
+    if (!authQuery.isLoading) return undefined
+    const id = globalThis.setTimeout(() => setSplashTimedOut(true), 3500)
+    return () => globalThis.clearTimeout(id)
+  }, [authQuery.isLoading])
+
   const authState = {
-    checked: !authQuery.isLoading,
-    authenticated: authQuery.data?.authenticated ?? false,
-    authRequired: authQuery.data?.authRequired ?? true,
+    checked: !authQuery.isLoading || splashTimedOut,
+    authenticated: authQuery.data?.authenticated ?? true,
+    authRequired: authQuery.data?.authRequired ?? false,
   }
 
   // Derive active session from URL
@@ -143,12 +154,20 @@ export function WorkspaceShell() {
   const showDesktopSidebarBackdrop =
     !isMobile && !isOnChatRoute && !sidebarCollapsed
 
-  // Sessions query — shared across sidebar and chat
+  const shouldLivePollSessions =
+    pathname.startsWith('/chat') ||
+    pathname === '/new' ||
+    pathname === '/' ||
+    pathname.startsWith('/dashboard')
+
+  // Sessions query — shared across sidebar and chat, but keep it light.
   const sessionsQuery = useQuery({
     queryKey: chatQueryKeys.sessions,
     queryFn: fetchSessions,
-    refetchInterval: 15_000,
-    staleTime: 10_000,
+    refetchInterval: shouldLivePollSessions ? 60_000 : 120_000,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    staleTime: 60_000,
   })
 
   const sessions = sessionsQuery.data ?? []
@@ -253,60 +272,12 @@ export function WorkspaceShell() {
     )
   }
 
-  if (authQuery.isError) {
-    const errorMessage =
-      authQuery.error instanceof Error
+  const authQueryErrorMessage =
+    authQuery.isError
+      ? authQuery.error instanceof Error
         ? authQuery.error.message
         : 'Failed to connect to ClawSuite server'
-    const showGatewayTip = /gateway|websocket/i.test(errorMessage)
-
-    return (
-      <div className="flex h-screen items-center justify-center bg-surface px-6">
-        <div className="w-full max-w-lg text-center">
-          <div className="mx-auto mb-4 flex size-14 items-center justify-center rounded-2xl border border-primary-800 bg-primary-900/80 text-2xl">
-            <span role="img" aria-label="Warning">
-              ⚠️
-            </span>
-          </div>
-          <h1 className="text-2xl font-semibold text-primary-100">
-            Could not connect to ClawSuite server
-          </h1>
-          <p className="mt-3 text-sm text-primary-300">
-            The server may still be starting up. Wait a moment and try again.
-          </p>
-          {showGatewayTip ? (
-            <p className="mt-3 text-sm text-accent-400">
-              Make sure OpenClaw gateway is running:{' '}
-              <code className="rounded bg-primary-900 px-1.5 py-0.5 text-xs text-primary-200">
-                openclaw gateway start
-              </code>
-            </p>
-          ) : null}
-          <div className="mt-6 flex flex-col justify-center gap-3 sm:flex-row">
-            <Button
-              variant="secondary"
-              size="lg"
-              onClick={() => void authQuery.refetch()}
-            >
-              <HugeiconsIcon icon={RefreshIcon} size={18} strokeWidth={1.8} />
-              Retry
-            </Button>
-            <Button size="lg" onClick={() => window.location.reload()}>
-              Reload Page
-            </Button>
-          </div>
-          <details className="mt-5 text-left">
-            <summary className="cursor-pointer text-xs text-primary-400">
-              Details
-            </summary>
-            <p className="mt-2 rounded-lg border border-primary-800 bg-primary-900/80 px-3 py-2 text-xs text-primary-300">
-              {errorMessage}
-            </p>
-          </details>
-        </div>
-      </div>
-    )
-  }
+      : null
 
   // Show login screen if auth is required and not authenticated
   if (authState.authRequired && !authState.authenticated) {
@@ -326,6 +297,21 @@ export function WorkspaceShell() {
         style={shellStyle}
       >
         {/* Electron: native-style title bar (absolute over the padding) */}
+        {authQueryErrorMessage ? (
+          <div className="absolute inset-x-0 top-0 z-50 flex justify-center px-3 py-2 pointer-events-none">
+            <div className="pointer-events-auto rounded-lg border border-amber-500/30 bg-amber-500/12 px-3 py-2 text-xs text-amber-100 shadow-lg backdrop-blur-sm">
+              ClawSuite had a brief local auth-check hiccup, but the app is staying live.
+              <button
+                type="button"
+                className="ml-2 underline underline-offset-2"
+                onClick={() => void authQuery.refetch()}
+              >
+                Retry
+              </button>
+            </div>
+          </div>
+        ) : null}
+
         {isElectron && (
           <div
             className="absolute inset-x-0 top-0 flex h-10 items-center border-b border-primary-200 dark:border-neutral-800 bg-neutral-100 dark:bg-neutral-900 z-40"
@@ -416,7 +402,9 @@ export function WorkspaceShell() {
       </div>
 
       {isMobile ? <MobileTabBar /> : null}
-      {settings.showSystemMetricsFooter ? <SystemMetricsFooter /> : null}
+      {settings.showSystemMetricsFooter && pathname.startsWith('/dashboard') ? (
+        <SystemMetricsFooter enabled />
+      ) : null}
       <CommandPalette pathname={pathname} sessions={sessions} />
     </>
   )

@@ -997,7 +997,6 @@ export function ChatScreen({
         if (!res.ok) return ''
         const data = await res.json()
         const payload = data.payload ?? data
-        // Same logic as chat-composer: read model from status payload
         if (payload.model) return String(payload.model)
         if (payload.currentModel) return String(payload.currentModel)
         if (payload.modelAlias) return String(payload.modelAlias)
@@ -1009,7 +1008,10 @@ export function ChatScreen({
         return ''
       }
     },
-    refetchInterval: 30_000,
+    staleTime: 10 * 60 * 1000,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    refetchOnMount: false,
     retry: false,
   })
 
@@ -1174,20 +1176,47 @@ export function ChatScreen({
     }
   }, [waitingForResponse, isRealtimeStreaming, liveToolActivity, setLocalActivity])
 
+  // Mirror Hermes Workspace: trust the live SSE connection as the source of truth.
+  // Only run the explicit status probe when SSE is NOT connected, and even then
+  // do not poll. This eliminates the duplicate probes that were tripping the
+  // OCPlatform gateway circuit breaker.
   const gatewayStatusQuery = useQuery({
     queryKey: ['gateway', 'status'],
     queryFn: fetchGatewayStatus,
-    retry: 2,
-    retryDelay: 1000,
-    refetchOnWindowFocus: true,
-    refetchOnReconnect: true,
-    refetchOnMount: true,
-    staleTime: 30_000,
-    refetchInterval: 60_000, // Re-check every 60s to clear stale errors
+    enabled: connectionState !== 'connected' && !isNewChat,
+    retry: 1,
+    retryDelay: 2000,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    refetchOnMount: false,
+    staleTime: 120_000,
+    refetchInterval: false, // no polling — only run on demand / when SSE drops
   })
-  // Don't show gateway errors for new chats or when SSE is connected (proves gateway works)
+  // Gateway banner gating:
+  //   * never show in a new-chat surface
+  //   * never show while SSE is connected (proves the gateway works regardless
+  //     of what the status RPC says)
+  //   * never show for auth issues like missing/invalid token (status === 401) — those
+  //     are routed through the setup wizard, not a chat banner
+  //   * require persistent failure: only flip on once we have at least 2 consecutive
+  //     status errors so a single transient timeout does not flash the user a scary
+  //     "Gateway unreachable" toast
+  const persistentFailureRef = useRef({ count: 0, lastErrorAt: 0 })
+  useEffect(() => {
+    const isFailing =
+      (gatewayStatusQuery.error instanceof Error) ||
+      (gatewayStatusQuery.data && !gatewayStatusQuery.data.ok)
+    if (isFailing) {
+      persistentFailureRef.current.count += 1
+      persistentFailureRef.current.lastErrorAt = Date.now()
+    } else if (gatewayStatusQuery.data?.ok) {
+      persistentFailureRef.current.count = 0
+      persistentFailureRef.current.lastErrorAt = 0
+    }
+  }, [gatewayStatusQuery.data, gatewayStatusQuery.error, gatewayStatusQuery.dataUpdatedAt, gatewayStatusQuery.errorUpdatedAt])
+
   const gatewayStatusError =
-    !isNewChat && connectionState !== 'connected'
+    !isNewChat && connectionState !== 'connected' && persistentFailureRef.current.count >= 2
       ? gatewayStatusQuery.error instanceof Error
         ? {
             message: gatewayStatusQuery.error.message,
@@ -1201,8 +1230,13 @@ export function ChatScreen({
             }
           : null
       : null
-  const gatewayError = gatewayStatusError?.message ?? sessionsError ?? historyError
-  const gatewayErrorStatus = gatewayStatusError?.status
+  // Suppress auth/pairing errors here — they're handled by the setup wizard.
+  const suppressForAuth =
+    gatewayStatusError?.status === 401 ||
+    gatewayStatusError?.status === 403 ||
+    /unauthorized|missing token|pair/i.test(gatewayStatusError?.message ?? '')
+  const gatewayError = suppressForAuth ? null : (gatewayStatusError?.message ?? sessionsError ?? historyError)
+  const gatewayErrorStatus = suppressForAuth ? undefined : gatewayStatusError?.status
   const showErrorNotice = Boolean(gatewayError) && !isNewChat
   const handleGatewayRefetch = useCallback(() => {
     void gatewayStatusQuery.refetch()
